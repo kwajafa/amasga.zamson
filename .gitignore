@@ -1,0 +1,6 @@
+# Data exports and source workbooks (may contain customer details)
+*.xlsx
+*.xls
+*.csv
+seed*.json
+.DS_Store
