@@ -1,0 +1,9 @@
+{
+  "name": "amasga-zamson-transport",
+  "private": true,
+  "description": "Amasga–Zamson Transport Collaboration Scheme App",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}

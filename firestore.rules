@@ -1,0 +1,46 @@
+rules_version = '2';
+// Paste this into Firebase console → Firestore Database → Rules, then Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function profile() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile().active != false;
+    }
+    function isAdmin() { return active() && profile().role == 'admin'; }
+    function isStaff() { return active() && profile().role in ['admin', 'entry']; }
+
+    // Trip records: everyone with an active account can read; Admins and
+    // Entry officers can add, edit, update offloading status and delete.
+    match /records/{id} {
+      allow read: if active();
+      allow create, update, delete: if isStaff();
+    }
+
+    // Receiving customer name and phone: Admins and Entry officers only.
+    match /cust/{id} {
+      allow read, write: if isStaff();
+    }
+
+    // User profiles: readable by active users (names on records);
+    // written only by the server (api/admin.js).
+    match /users/{uid} {
+      allow read: if active() || (signedIn() && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    // Username → login email lookup, needed before sign-in.
+    match /usernames/{name} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Role rights and app settings.
+    match /settings/{doc} {
+      allow read: if active();
+      allow write: if isAdmin();
+    }
+  }
+}

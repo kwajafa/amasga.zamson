@@ -345,6 +345,9 @@ label .req{color:var(--acc2)}
 <datalist id="dlQty"><option value="900"><option value="1200"></datalist>
 <div class="toast" id="toast" role="status"></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script>
 {
 /* ================= helpers ================= */
@@ -370,7 +373,6 @@ const UP=new Set(['truck','fleet','driver','location','state','sendBank','recvBa
 const STATUSES=['LOADED','IN TRANSIT','PENDING','OFFLOADED'];
 const ROLES={admin:'Admin',entry:'Entry officer',member:'Member'};
 const ROLE_DESC={admin:'Can do everything, including accounts and rights',entry:'Enters trip records, updates offloading and views all records',member:'Views transactions; customer details hidden'};
-const SHARE={admin:'Editor',entry:'Editor',member:'Viewer'};
 const RIGHTS_DEF={member:{amounts:true,banks:false,driverPhone:false,atc:true,reports:true,export:false},entry:{edit:true,delete:false,reports:true,export:true,import:true}};
 const RIGHT_LABEL={amounts:['See prices and amounts paid','Price, amount paid and balances'],banks:['See bank details','Sending and receiving bank, transaction date'],driverPhone:["See drivers' phone numbers",''],atc:['See ATC numbers',''],reports:['Open the Reports section','Monthly and yearly performance'],export:['Download reports and records','PDF and CSV files'],edit:['Edit existing trips','Change trips already entered'],delete:['Delete trips','Remove trips permanently'],import:['Import from Excel','Bring in records from a workbook']};
 const I=p=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${p}</svg>`;
@@ -379,9 +381,9 @@ const ICON={rec:I('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 
   plus:I('<path d="M12 5v14M5 12h14"/>'),user:I('<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/>'),team:I('<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c1-3.5 3.5-5 6.5-5s5.5 1.5 6.5 5"/><path d="M16 4.5a3.5 3.5 0 010 7M18 15c2 .7 3.2 2.3 3.8 5"/>'),
   key:I('<circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/>'),data:I('<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),pref:I('<rect x="5" y="2" width="14" height="20" rx="3"/><path d="M10 18h4"/>'),info:I('<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/>')};
 
-let db=null,cuser=null,downloads=null,isOwner=false,adminLvl=false;
+let db=null,fs=null,auth=null,fbUser=null,meDoc={};
 let users={},usersLoaded=false,settings={},rawRecs=new Map(),custMap=new Map(),recs=[];
-let me=null,role=null,view='records',shown=60,editing=null,mode='month',chip='all',fleetF='',selected=new Set(),setPage='home',loadedRecs=false,migrating=false,entered=false;
+let me=null,role=null,view='records',shown=60,editing=null,mode='month',chip='all',fleetF='',selected=new Set(),setPage='home',loadedRecs=false,entered=false;
 const store=(()=>{try{localStorage.setItem('_t','1');localStorage.removeItem('_t');return localStorage}catch(e){return null}})();
 const ss=(()=>{try{return sessionStorage}catch(e){return null}})();
 const prefs=(()=>{try{return JSON.parse(store?.getItem('az-prefs')||'{}')}catch(e){return{}}})();
@@ -391,11 +393,7 @@ const pageSize=()=>+prefs.page||60;
 const toast=t=>{const e=$('#toast');e.textContent=t;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2400)};
 const initials=n=>(n||'U').trim().split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
 
-/* ================= passwords ================= */
-const b64=buf=>btoa(String.fromCharCode(...new Uint8Array(buf)));
-const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
-async function hashPw(pw,salt,iter){const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits']);return b64(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:unb64(salt),iterations:iter},k,256))}
-async function newPw(pw){const salt=b64(crypto.getRandomValues(new Uint8Array(16))),iter=150000;return{salt,iter,hash:await hashPw(pw,salt,iter)}}
+/* ================= password rules ================= */
 const pwOk=p=>p.length>=8&&/[A-Za-z]/.test(p)&&/\d/.test(p);
 const genPw=()=>{const a='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789',r=crypto.getRandomValues(new Uint8Array(10));let s=[...r].map(x=>a[x%a.length]).join('');return /\d/.test(s)?s:s.slice(0,9)+'7'};
 const unameOk=u=>/^[a-z0-9][a-z0-9._-]{2,29}$/.test(u);
@@ -426,102 +424,99 @@ const keyOf=r=>{const s=[r.loadDate,r.truck,r.atc,r.qty,r.customer].join('|');le
 async function retry(fn){for(let t=0;;t++){try{return await fn()}catch(e){if(t>=3||e?.code==='invalid_argument'||e?.code==='quota_exceeded')throw e;await sleep(800*(t+1)+Math.random()*400)}}}
 async function saveTrip(id,d){const pub={},c={};for(const k in d)(CUST.includes(k)?c:pub)[k]=d[k];await retry(()=>db.doc('records/'+id).set(pub));await retry(()=>db.doc('cust/'+id).set({customer:c.customer||'',custPhone:c.custPhone||''}))}
 const nameOf=u=>users[u]?.name||u||'—';
-const refused=e=>e?.code==='invalid_argument'?'Saving was refused. The Claude account on this device needs Editor access to the app. Ask the owner to change it in the Share menu.':e?.code==='quota_exceeded'?'Storage is full. Please contact the admin.':'Could not save. Check your connection and try again.';
+const refused=e=>e?.code==='permission-denied'?'You don\'t have permission to do that with your role.':e?.code==='resource-exhausted'?'The database is over its daily free limit. Try again tomorrow or upgrade the Firebase plan.':e?.code==='unavailable'?'No connection. Your change will be sent when you are back online.':(e?.message&&!e.code?e.message:'Could not save. Check your connection and try again.');
 
-/* ================= boot & login ================= */
+/* ================= backend (Firebase) ================= */
+const API='/api/admin';
+async function api(action,body,noAuth){
+  const h={'Content-Type':'application/json'};if(!noAuth&&auth?.currentUser)h.Authorization='Bearer '+await auth.currentUser.getIdToken();
+  let r;try{r=await fetch(API,{method:'POST',headers:h,body:JSON.stringify({action,...(body||{})})})}catch(e){throw new Error('Could not reach the server. Check your connection.')}
+  let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||'Server error ('+r.status+').');return j;
+}
 const LB=$('#lBody');
+const TTL='Amasga–Zamson Transport Collaboration Scheme App';
 async function boot(){
-  const use=n=>window.claude?.use?window.claude.use(n).catch(()=>null):Promise.resolve(null);
-  [db,cuser,downloads]=await Promise.all([use('db'),use('user'),use('downloads')]);
-  if(!db){LB.innerHTML=`<h1>Amasga–Zamson Transport Collaboration Scheme App</h1><p>This app opens inside Claude. Sign in to the Claude account the app was shared with, then open it again.</p>`;return}
-  try{isOwner=!!await cuser?.isOwner();adminLvl=!!await cuser?.canEdit()}catch(e){}
-  const t=setTimeout(()=>{if(!usersLoaded){usersLoaded=true;onUsers()}},9000);
-  db.collection('users').onSnapshot(s=>{clearTimeout(t);users={};s.docs.forEach(d=>users[d.id]=d.data());usersLoaded=true;onUsers()},()=>{usersLoaded=true;onUsers()});
-  db.doc('settings/app').onSnapshot(s=>{settings=s.exists?s.data():{};if(entered){renderNav();render(setPage==='rights'&&!pendR)}},()=>{});
+  let cfg=null;try{cfg=await (await fetch('/api/config')).json()}catch(e){}
+  if(!cfg||!cfg.apiKey||!window.firebase){LB.innerHTML=`<h1>${TTL}</h1><p>The app isn't connected to its database yet. ${cfg&&cfg.error?esc(cfg.error):'The administrator needs to finish the Firebase setup described in the README.'}</p>`;return}
+  firebase.initializeApp(cfg);fs=firebase.firestore();auth=firebase.auth();db=fs;
+  auth.onAuthStateChanged(u=>{fbUser=u;if(!u){if(entered)endSession();showLogin(logoutMsg);logoutMsg='';return}watchMe(u)});
 }
-function onUsers(){
-  if(!entered){
-    const sess=getSession();
-    if(sess&&users[sess.u]&&users[sess.u].active!==false&&users[sess.u].hash.slice(0,16)===sess.sig){startSession(sess.u,false);return}
-    if(!LB.dataset.mode)showLogin();return;
-  }
-  const u=users[me];
-  if(!u||u.active===false||u.hash.slice(0,16)!==sigNow){logout(u&&u.active!==false?'Your password was changed. Please log in again.':'Your account is no longer active.');return}
-  if(u.role!==role){role=u.role;subscribeData();toast('Your role is now '+ROLES[role])}
-  renderNav();render(setPage==='accounts');
+let meUnsub=null,logoutMsg='';
+function watchMe(u){
+  meUnsub&&meUnsub();
+  meUnsub=fs.doc('users/'+u.uid).onSnapshot(s=>{
+    const d=s.exists?s.data():null;
+    if(!d||d.active===false){logoutMsg=d?'This account has been deactivated. Contact the Admin.':'No user profile was found for this login. Contact the Admin.';auth.signOut();return}
+    meDoc=d;const nr=d.role in ROLES?d.role:'member';
+    if(!entered){startSession(u.uid,nr);return}
+    if(nr!==role){role=nr;subscribeData();toast('Your role is now '+ROLES[role])}
+    $('#hrole').innerHTML=esc((d.name||'').split(' ')[0])+'<br>'+esc(ROLES[role]);renderNav();render(setPage==='account');
+  },()=>{logoutMsg='Could not load your profile.';auth.signOut()});
 }
-function getSession(){try{return JSON.parse(ss?.getItem('az-sess')||store?.getItem('az-sess')||'null')}catch(e){return null}}
-function showLogin(msg){
-  const none=!Object.keys(users).length;LB.dataset.mode=none?'setup':'login';
-  if(none&&!isOwner){LB.innerHTML=`<h1>Amasga–Zamson Transport Collaboration Scheme App</h1><p>The app hasn't been set up yet. The owner needs to open it first and create the Admin account.</p>`;return}
-  if(none){LB.innerHTML=`<h1>Set up the Admin account</h1><p>You're the owner. Create the first Admin login; you'll use it to create everyone else's accounts.</p>
-    <form id="lf" novalidate><label>Full name<input class="in" id="sName" autocomplete="name" required></label>
+async function showLogin(msg){
+  $('#app').classList.add('hide');$('#login').classList.remove('hide');
+  LB.innerHTML=`<h1>${TTL}</h1><p>Checking…</p>`;
+  let st={};try{st=await api('status',{},true)}catch(e){st={error:e.message}}
+  if(st.error){LB.innerHTML=`<h1>${TTL}</h1><p>${esc(st.error)}</p>`;return}
+  if(st.setup){
+    LB.innerHTML=`<h1>Set up the Admin account</h1><p>No accounts exist yet. Create the first Admin login; you'll use it to create everyone else's accounts.</p>
+    <form id="lf" novalidate><label>Full name<input class="in" id="sName" autocomplete="name"></label>
     <label>Username<input class="in" id="sUser" autocomplete="username" autocapitalize="none" placeholder="e.g. umar.kwajafa"></label>
     <label>Email <span class="hint">(optional, can be used to log in)</span><input class="in" id="sMail" type="email" autocomplete="email"></label>
     <label>Password <span class="hint">(at least 8 characters, letters and a number)</span><span class="pw"><input class="in" id="sPw" type="password" autocomplete="new-password"><button type="button" data-show aria-label="Show password" aria-pressed="false">Show</button></span></label>
-    <p class="err" id="lErr"></p><button class="btn full">Create Admin and log in</button></form>`;
-    $('#lf').onsubmit=async e=>{e.preventDefault();const n=$('#sName').value.trim(),u=$('#sUser').value.trim().toLowerCase(),m=$('#sMail').value.trim().toLowerCase(),p=$('#sPw').value;
+    <p class="err" id="lErr"></p><button class="btn full" id="lGo">Create Admin and log in</button></form>`;
+    $('#lf').onsubmit=async e=>{e.preventDefault();const n=$('#sName').value.trim(),u=$('#sUser').value.trim().toLowerCase(),m=$('#sMail').value.trim().toLowerCase(),p=$('#sPw').value,btn=$('#lGo');
       const er=!n?'Enter your full name.':!unameOk(u)?'Username: 3–30 characters, letters, numbers, dot, dash or underscore.':!emailOk(m)?'Enter a valid email or leave it blank.':!pwOk(p)?'Password needs at least 8 characters with letters and a number.':'';if(er){$('#lErr').textContent=er;return}
-      try{const np=await newPw(p);setSession(u,np.hash,true);LB.dataset.mode='';await db.doc('users/'+u).set({name:n,email:m,role:'admin',active:true,...np,createdAt:new Date().toISOString(),createdBy:'owner'})}catch(x){LB.dataset.mode='setup';try{store?.removeItem('az-sess')}catch(z){}$('#lErr').textContent=refused(x)}};
-    bindShow();return}
-  LB.innerHTML=`<h1>Amasga–Zamson Transport Collaboration Scheme App</h1><p>Log in with the username or email and password the Admin gave you.</p>
+      btn.disabled=true;btn.textContent='Creating…';
+      try{const r=await api('bootstrap',{name:n,username:u,email:m,password:p},true);await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);await auth.signInWithEmailAndPassword(r.authEmail,p)}
+      catch(x){$('#lErr').textContent=x.message||'Could not create the account.';btn.disabled=false;btn.textContent='Create Admin and log in'}};
+    return}
+  LB.innerHTML=`<h1>${TTL}</h1><p>Log in with the username or email and password the Admin gave you.</p>
     <form id="lf" novalidate><label>Username or email<input class="in" id="lUser" autocomplete="username" autocapitalize="none" spellcheck="false"></label>
     <label>Password<span class="pw"><input class="in" id="lPw" type="password" autocomplete="current-password"><button type="button" data-show aria-label="Show password" aria-pressed="false">Show</button></span></label>
     <label class="chk"><input type="checkbox" id="lKeep" checked> Keep me logged in on this device</label>
     <p class="err" id="lErr">${esc(msg||'')}</p><button class="btn full" id="lGo">Log in</button></form>
-    ${isOwner?'<button class="linkb" id="lRec">Forgot the Admin password? Reset it as owner</button>':'<p class="note">Forgot your password? Ask the Admin to reset it.</p>'}`;
-  $('#lf').onsubmit=doLogin;bindShow();$('#lRec')?.addEventListener('click',ownerReset);setTimeout(()=>$('#lUser')?.focus(),50);
+    <button class="linkb" id="lForgot">Forgot your password?</button>`;
+  $('#lf').onsubmit=doLogin;$('#lForgot').onclick=forgot;setTimeout(()=>$('#lUser')?.focus(),50);
 }
-function bindShow(){}
-document.addEventListener('click',e=>{const b=e.target.closest('[data-show]');if(!b)return;e.preventDefault();const i=b.closest('.pw').querySelector('input');const show=i.type==='password';i.type=show?'text':'password';b.textContent=show?'Hide':'Show';b.setAttribute('aria-pressed',show);i.focus()});
-let fails=0,lockUntil=0;
+async function authEmailFor(id){
+  if(id.includes('@'))return id;
+  const s=await fs.doc('usernames/'+id).get();return s.exists?s.data().email:null;
+}
 async function doLogin(e){
   e.preventDefault();const err=$('#lErr'),btn=$('#lGo');
-  if(Date.now()<lockUntil){err.textContent='Too many attempts. Try again in a few seconds.';return}
   const id=$('#lUser').value.trim().toLowerCase(),pw=$('#lPw').value;if(!id||!pw){err.textContent='Enter your username or email and password.';return}
-  btn.disabled=true;btn.textContent='Checking…';
+  btn.disabled=true;btn.textContent='Checking…';err.textContent='';
   try{
-    const uname=users[id]?id:Object.keys(users).find(k=>(users[k].email||'')===id);const u=uname&&users[uname];
-    const ok=u&&u.active!==false&&await hashPw(pw,u.salt,u.iter||150000)===u.hash;
-    if(!ok){fails++;if(fails>=5){lockUntil=Date.now()+30000;fails=0}err.textContent=u&&u.active===false?'This account has been deactivated. Contact the Admin.':'Username/email or password is incorrect.';return}
-    fails=0;setSession(uname,u.hash,$('#lKeep').checked);startSession(uname,true);
-  }catch(x){err.textContent='Login is not available in this browser.'}
-  finally{btn.disabled=false;btn.textContent='Log in'}
+    const em=unameOk(id)||id.includes('@')?await authEmailFor(id):null;if(!em)throw{code:'auth/invalid-credential'};
+    await auth.setPersistence($('#lKeep').checked?firebase.auth.Auth.Persistence.LOCAL:firebase.auth.Auth.Persistence.SESSION);
+    await auth.signInWithEmailAndPassword(em,pw);
+  }catch(x){const c=x?.code||'';err.textContent=c==='auth/user-disabled'?'This account has been deactivated. Contact the Admin.':c==='auth/too-many-requests'?'Too many attempts. Wait a few minutes and try again.':c==='auth/network-request-failed'?'No connection. Check your internet and try again.':'Username/email or password is incorrect.';btn.disabled=false;btn.textContent='Log in'}
 }
-function setSession(u,hash,keep){const v=JSON.stringify({u,sig:hash.slice(0,16)});try{ss?.removeItem('az-sess');store?.removeItem('az-sess');(keep?store:ss)?.setItem('az-sess',v)}catch(e){}}
-let sigNow='';
-function startSession(u,fresh){
-  me=u;role=users[u].role in ROLES?users[u].role:'member';sigNow=users[u].hash.slice(0,16);entered=true;LB.dataset.mode='';
+function forgot(){
+  dialog('Forgot your password?',`<p class="mute" style="margin:0 0 10px">If your account has a real email address, we can send you a reset link. Otherwise ask the Admin to set a new password for you.</p><label>Email<input class="in" id="fpE" type="email" autocapitalize="none"></label><p class="err" id="fpX" style="padding:8px 0 0"></p>`,
+   [{label:'Cancel',cls:'ghost',fn:()=>closeVeil('#vDlg')},{label:'Send reset link',fn:async()=>{const m=$('#fpE').value.trim().toLowerCase();if(!emailOk(m)||!m){$('#fpX').textContent='Enter your email address.';return}
+     try{await auth.sendPasswordResetEmail(m)}catch(x){}closeVeil('#vDlg');toast('If that email has an account, a reset link is on its way.')}}]);
+}
+function startSession(uid,r){
+  me=uid;role=r;entered=true;
   $('#login').classList.add('hide');$('#app').classList.remove('hide');
-  $('#hav').textContent=initials(users[u].name);$('#hrole').innerHTML=esc(users[u].name.split(' ')[0])+'<br>'+esc(ROLES[role]);
-  subscribeData();renderNav();const st=prefs.start&&visibleViews().includes(prefs.start)?prefs.start:'records';go(st);if(fresh)toast('Welcome, '+users[u].name.split(' ')[0]);
+  $('#hav').textContent=initials(meDoc.name);$('#hrole').innerHTML=esc((meDoc.name||'').split(' ')[0])+'<br>'+esc(ROLES[role]);
+  subscribeData();renderNav();const st=prefs.start&&visibleViews().includes(prefs.start)?prefs.start:'records';go(st);toast('Welcome, '+(meDoc.name||'').split(' ')[0]);
 }
-function logout(msg){try{ss?.removeItem('az-sess');store?.removeItem('az-sess')}catch(e){}entered=false;me=role=null;unsubs.forEach(u=>u());unsubs=[];$$('.veil.on').forEach(v=>v.classList.remove('on'));document.body.style.overflow='';
-  $('#app').classList.add('hide');$('#login').classList.remove('hide');showLogin(msg);window.scrollTo(0,0)}
+function endSession(){entered=false;me=role=null;meUnsub&&meUnsub();meUnsub=null;unsubs.forEach(u=>u());unsubs=[];rawRecs=new Map();custMap=new Map();recs=[];users={};$$('.veil.on').forEach(v=>v.classList.remove('on'));document.body.style.overflow='';window.scrollTo(0,0)}
+function logout(msg){logoutMsg=msg||'';auth.signOut()}
 $('#navOut').addEventListener('click',()=>logout());
-$('#brand').addEventListener('click',()=>{$$('.veil.on').forEach(v=>closeVeil('#'+v.id));chip='all';fleetF='';$('#fQ').value='';const ms=months();$('#fMonth').value=ms[0]||'';$('#fDay').value='';shown=pageSize();selected.clear();go('records')});
-function ownerReset(){
-  const admins=Object.entries(users).filter(([,u])=>u.role==='admin');
-  dialog('Reset an Admin password',`<label>Admin account<select class="in" id="orU">${admins.map(([k,u])=>`<option value="${esc(k)}">${esc(u.name)} (${esc(k)})</option>`).join('')}</select></label>
-    <label>New password<span class="pw"><input class="in" id="orP" type="text" value="${esc(genPw())}"></span></label><p class="err" id="orE" style="padding:8px 0 0"></p>`,
-   [{label:'Cancel',cls:'ghost',fn:()=>closeVeil('#vDlg')},{label:'Reset password',fn:async()=>{const p=$('#orP').value;if(!pwOk(p)){$('#orE').textContent='At least 8 characters with letters and a number.';return}
-     try{await db.doc('users/'+$('#orU').value).update({...await newPw(p),active:true,updatedAt:new Date().toISOString()});closeVeil('#vDlg');toast('Password reset. Log in with it now.')}catch(x){$('#orE').textContent=refused(x)}}}]);
-}
-
 let unsubs=[];
 function subscribeData(){
   unsubs.forEach(u=>u());unsubs=[];loadedRecs=false;
-  const timer=setTimeout(()=>{if(!loadedRecs)$('#rList').innerHTML='<div class="empty">Records can\'t be reached yet. Check your connection.</div>'},10000);
-  unsubs.push(db.collection('records').onSnapshot(s=>{if(!s.metadata.fromCache){clearTimeout(timer);loadedRecs=true}rawRecs=new Map(s.docs.map(d=>[d.id,{id:d.id,...d.data()}]));onData();if(isOwner&&adminLvl)migrate()},e=>{clearTimeout(timer);$('#rList').innerHTML='<div class="empty">Could not load records ('+esc(e.code)+').</div>'}));
+  const timer=setTimeout(()=>{if(!loadedRecs)$('#rList').innerHTML='<div class="empty">Records can\'t be reached yet. Check your connection.</div>'},12000);
+  unsubs.push(db.collection('records').onSnapshot(s=>{if(!s.metadata.fromCache){clearTimeout(timer);loadedRecs=true}rawRecs=new Map(s.docs.map(d=>[d.id,{id:d.id,...d.data()}]));onData()},e=>{clearTimeout(timer);$('#rList').innerHTML='<div class="empty">Could not load records ('+esc(e.code||'error')+').</div>'}));
   if(can('seeCust'))unsubs.push(db.collection('cust').onSnapshot(s=>{custMap=new Map(s.docs.map(d=>[d.id,d.data()]));onData()},()=>{}));else custMap=new Map();
+  unsubs.push(db.collection('users').onSnapshot(s=>{users={};s.docs.forEach(d=>users[d.id]=d.data());usersLoaded=true;if(view==='settings'&&setPage==='accounts')renderSettings()},()=>{}));
+  unsubs.push(db.doc('settings/app').onSnapshot(s=>{settings=s.exists?s.data():{};renderNav();render(setPage==='rights'&&!pendR)},()=>{}));
 }
 let rafP=0;function onData(){if(rafP)return;rafP=requestAnimationFrame(()=>{rafP=0;rebuild();fillLists();renderNav();render()})}
-async function migrate(){
-  if(migrating)return;const todo=[...rawRecs.values()].filter(r=>CUST.some(k=>k in r));if(!todo.length)return;migrating=true;let n=0;
-  const show=()=>{$('#banners').innerHTML=`<div class="banner info">Securing customer details so only Admins and Entry officers can see them… ${n} of ${todo.length}</div>`};show();
-  for(const r of todo){try{const{id,customer,custPhone,...rest}=r;await retry(()=>db.doc('cust/'+id).set({customer:customer||'',custPhone:custPhone||''}));await retry(()=>db.doc('records/'+id).set(rest));n++;await sleep(40);if(n%5===0)show()}catch(e){}}
-  migrating=false;$('#banners').innerHTML='';renderBanners();
-}
 
 /* ================= navigation ================= */
 const TITLES={records:'Records',pending:'Pending offloading',reports:'Reports',settings:'Settings'};
@@ -535,7 +530,8 @@ function renderNav(){
   const h=items.map(([k,l,ic,b])=>`<button class="nav${k==='new'?' new':''}" data-go="${k}" ${k!=='new'?`aria-current="${view===k}"`:''}>${ic}<span>${l}</span>${b?`<span class="badge">${b>99?'99+':b}</span>`:''}</button>`).join('');
   if($('#navList').innerHTML!==h)$('#navList').innerHTML=h;renderBanners();
 }
-function renderBanners(){if(migrating)return;$('#banners').innerHTML=(role==='admin'||role==='entry')&&!adminLvl?`<div class="banner">You're logged in as ${esc(ROLES[role])}, but the Claude account on this device only has view access to the app, so saving will be refused. Ask the owner to share the app with this Claude account as <b>Editor</b>.</div>`:''}
+function renderBanners(){$('#banners').innerHTML=navigator.onLine===false?'<div class="banner info">You are offline. Changes will be sent when the connection returns.</div>':''}
+window.addEventListener('online',()=>entered&&renderBanners());window.addEventListener('offline',()=>entered&&renderBanners());
 $('#navList').addEventListener('click',e=>{const b=e.target.closest('[data-go]');if(!b)return;if(b.dataset.go==='new')openForm(null);else go(b.dataset.go)});
 $('#meChip').addEventListener('click',()=>{setPage='account';go.keep=true;go('settings')});
 function go(v){
@@ -781,7 +777,7 @@ const chartRO=new ResizeObserver(drawChart);
 /* ---------- exports ---------- */
 const csvCell=v=>{const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
 const csv=rows=>'﻿'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n');
-async function save(name,data){if(!downloads){toast('Downloads are not available here');return}try{await downloads.save({filename:name,data})}catch(e){if(e?.code==='host_unavailable')toast('Open the app in a browser to download');else if(e?.code!=='declined')toast('Download not available here')}}
+async function save(name,data){try{const b=data instanceof Blob?data:new Blob([data],{type:name.endsWith('.csv')?'text/csv;charset=utf-8':'application/octet-stream'}),u=URL.createObjectURL(b),el=document.createElement('a');el.href=u;el.download=name;document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),4000);toast('Downloaded '+name)}catch(e){toast('Download failed')}}
 function loadScript(src){return new Promise((ok,no)=>{const sc=document.createElement('script');sc.src=src;sc.onload=ok;sc.onerror=no;document.head.appendChild(sc)})}
 $('#xRep').addEventListener('click',()=>{
   const k=$('#pPer').value;if(!k)return;const R=report(k),a=R.a,$m=can('amounts');
@@ -814,7 +810,7 @@ function buildPdf(R,lg){
   const tx=lg?W-M:M,al=lg?{align:'right'}:{};doc.setTextColor(...INK);doc.setFont('helvetica','bold');doc.setFontSize(lg?13:16);
   if(lg){doc.text('AMASGA - ZAMSON TRANSPORT',tx,12,al);doc.text('COLLABORATION SCHEME',tx,18,al)}else doc.text('AMASGA - ZAMSON TRANSPORT COLLABORATION SCHEME',tx,13);
   doc.setFontSize(11.5);doc.setTextColor(...ACC);doc.text(R.label+' performance report',tx,25,al);
-  doc.setFont('helvetica','normal');doc.setFontSize(8.5);doc.setTextColor(...MUTE);doc.text('Generated '+fmtD(today())+' by '+(users[me]?.name||me),tx,30,al);
+  doc.setFont('helvetica','normal');doc.setFontSize(8.5);doc.setTextColor(...MUTE);doc.text('Generated '+fmtD(today())+' by '+(meDoc.name||'user'),tx,30,al);
   doc.setFillColor(...ACC);doc.rect(M,33.5,W-2*M,0.8,'F');doc.setFillColor(...CAB);doc.rect(M,34.3,W-2*M,0.4,'F');
   const k=[['Trips loaded',nf.format(a.trips)],['Bags delivered',nf.format(a.bags)]];
   if($m)k.push(['Trip value',N(a.value)],['Amount paid',N(a.paid)],['Outstanding',N(a.out)]);
@@ -863,7 +859,7 @@ function buildPdf(R,lg){
 /* ================= settings ================= */
 const vS=$('#v-settings');
 function renderSettings(){
-  const back=`<button class="back" data-sp="home">‹ Settings</button>`,u=users[me]||{};
+  const back=`<button class="back" data-sp="home">‹ Settings</button>`,u=meDoc||{};
   const row=(sp,ic,t,s)=>`<button class="row" data-sp="${sp}"><span class="ic">${ic}</span><span class="tx"><b>${t}</b><small>${s}</small></span><span class="go">›</span></button>`;
   if(setPage==='home'){
     const n=Object.keys(users).length;
@@ -871,26 +867,27 @@ function renderSettings(){
       ${role==='admin'?`<div class="list">${row('accounts',ICON.team,'User accounts',n+' account'+(n===1?'':'s')+' · create, reset passwords, roles')}${row('rights',ICON.key,'Role rights','Choose what Members and Entry officers can do')}</div>`:''}
       <div class="list">${can('import')||can('export')?row('data',ICON.data,'Data','Import from Excel, export all records'):''}${row('prefs',ICON.pref,'App preferences','Start screen, report view, list size')}${row('about',ICON.info,'About & help','Roles and how access works')}</div>`;
   }else if(setPage==='account'){
+    const u=meDoc;
     vS.innerHTML=`${back}<h1>My account</h1><div class="list"><div class="row"><span class="av">${esc(initials(u.name))}</span><span class="tx"><b>${esc(u.name||'')}</b><small>${esc(ROLES[role])} · ${esc(ROLE_DESC[role])}</small></span></div>
-      <div class="row"><span class="tx"><small>Username</small><b>${esc(me)}</b></span><span class="tx"><small>Email</small><b>${esc(u.email||'—')}</b></span></div></div>
-      <div class="panel"><h3>Change password</h3>${adminLvl?`<label>Current password<input class="in" type="password" id="cp0" autocomplete="current-password"></label><label style="margin-top:10px">New password <span class="hint">(8+ characters, letters and a number)</span><input class="in" type="password" id="cp1" autocomplete="new-password"></label><label style="margin-top:10px">Confirm new password<input class="in" type="password" id="cp2" autocomplete="new-password"></label><p class="err" id="cpE" style="padding:8px 0 0"></p><button class="btn" id="cpGo" style="margin-top:6px">Update password</button>`:'<p class="k" style="margin:0">Ask the Admin to change your password for you.</p>'}</div>
+      <div class="row"><span class="tx"><small>Username</small><b>${esc(u.username||'')}</b></span><span class="tx"><small>Email</small><b>${esc(u.email||'—')}</b></span></div></div>
+      <div class="panel"><h3>Change password</h3><label>Current password<input class="in" type="password" id="cp0" autocomplete="current-password"></label><label style="margin-top:10px">New password <span class="hint">(8+ characters, letters and a number)</span><input class="in" type="password" id="cp1" autocomplete="new-password"></label><label style="margin-top:10px">Confirm new password<input class="in" type="password" id="cp2" autocomplete="new-password"></label><p class="err" id="cpE" style="padding:8px 0 0"></p><button class="btn" id="cpGo" style="margin-top:6px">Update password</button></div>
       <div class="panel"><h3>What you can do</h3><p class="k" style="margin:0">${esc(rightsSummary(role))}</p></div>
       <button class="btn ghost" id="sOut" style="width:100%">Log out</button>`;
     $('#sOut').onclick=()=>logout();
-    $('#cpGo')?.addEventListener('click',async()=>{const p0=$('#cp0').value,p1=$('#cp1').value,p2=$('#cp2').value,e=$('#cpE');
-      if(await hashPw(p0,u.salt,u.iter||150000)!==u.hash){e.textContent='Current password is incorrect.';return}if(!pwOk(p1)){e.textContent='New password needs 8+ characters with letters and a number.';return}if(p1!==p2){e.textContent="The new passwords don't match.";return}
-      try{const np=await newPw(p1);sigNow=np.hash.slice(0,16);await db.doc('users/'+me).update({...np,updatedAt:new Date().toISOString()});const keep=!!store?.getItem('az-sess');setSession(me,np.hash,keep);toast('Password updated');$('#cp0').value=$('#cp1').value=$('#cp2').value='';e.textContent=''}catch(x){sigNow=u.hash.slice(0,16);e.textContent=refused(x)}});
+    $('#cpGo').addEventListener('click',async()=>{const p0=$('#cp0').value,p1=$('#cp1').value,p2=$('#cp2').value,e=$('#cpE'),b=$('#cpGo');
+      if(!p0){e.textContent='Enter your current password.';return}if(!pwOk(p1)){e.textContent='New password needs 8+ characters with letters and a number.';return}if(p1!==p2){e.textContent="The new passwords don't match.";return}
+      b.disabled=true;try{const cu=auth.currentUser;await cu.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(cu.email,p0));await cu.updatePassword(p1);toast('Password updated');$('#cp0').value=$('#cp1').value=$('#cp2').value='';e.textContent=''}
+      catch(x){const c=x?.code||'';e.textContent=c.includes('wrong-password')||c.includes('invalid-credential')||c.includes('invalid-login')?'Current password is incorrect.':c==='auth/too-many-requests'?'Too many attempts. Try again later.':'Could not update the password. Try again.'}finally{b.disabled=false}});
   }else if(setPage==='accounts'&&role==='admin'){
-    const ids=Object.keys(users).sort((a,b)=>({admin:0,entry:1,member:2}[users[a].role]-{admin:0,entry:1,member:2}[users[b].role])||a.localeCompare(b));
+    const rk={admin:0,entry:1,member:2},ids=Object.keys(users).sort((a,b)=>(rk[users[a].role]-rk[users[b].role])||String(users[a].username).localeCompare(users[b].username));
     vS.innerHTML=`${back}<h1>User accounts</h1><button class="btn" id="sAdd" style="width:100%;margin-bottom:14px">+ Create account</button>
-      <div class="list">${ids.map(id=>{const x=users[id],off=x.active===false;return `<div class="row" style="${off?'opacity:.6':''}"><span class="av" style="${x.role==='admin'?'':'background:var(--sup)'}">${esc(initials(x.name))}</span><span class="tx"><b>${esc(x.name)}${id===me?' (you)':''}</b><small>${esc(id)}${x.email?' · '+esc(x.email):''}${off?' · deactivated':''}</small></span>
+      <div class="list">${ids.length?ids.map(id=>{const x=users[id],off=x.active===false;return `<div class="row" style="${off?'opacity:.6':''}"><span class="av" style="${x.role==='admin'?'':'background:var(--sup)'}">${esc(initials(x.name))}</span><span class="tx"><b>${esc(x.name)}${id===me?' (you)':''}</b><small>${esc(x.username)}${x.email?' · '+esc(x.email):''}${off?' · deactivated':''}</small></span>
         <span class="ops"><select class="in" data-role="${esc(id)}" aria-label="Role" ${id===me?'disabled':''}>${Object.entries(ROLES).map(([k,l])=>`<option value="${k}" ${x.role===k?'selected':''}>${l}</option>`).join('')}</select>
-        <button class="btn ghost sm" data-edit="${esc(id)}">Manage</button></span></div>`}).join('')}</div>
-      <div class="panel guide"><h3>Claude sharing level</h3><p class="k">Everyone opens the app through a Claude account it is shared with. Admins and Entry officers must use a Claude account shared as <b>Editor</b>, or their saves will be refused. Members can use a Viewer account. Customer details can only be read by Editor accounts.</p>
-      <table><tbody>${Object.keys(ROLES).map(k=>`<tr><td>${ROLES[k]}</td><td>${SHARE[k]}</td></tr>`).join('')}</tbody></table></div>`;
+        <button class="btn ghost sm" data-edit="${esc(id)}">Manage</button></span></div>`}).join(''):'<div class="empty">Loading accounts…</div>'}</div>
+      <div class="panel"><h3>How logins work</h3><p class="k" style="margin:0">Each person logs in with their username or email and the password you set. Passwords are handled by Firebase Authentication and are never stored in the app. Deactivating an account signs the person out straight away.</p></div>`;
     $('#sAdd').onclick=()=>accountDlg(null);
     vS.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>accountDlg(b.dataset.edit));
-    vS.querySelectorAll('[data-role]').forEach(s=>s.onchange=async()=>{if(s.value!=='admin'&&users[s.dataset.role].role==='admin'&&Object.values(users).filter(x=>x.role==='admin'&&x.active!==false).length<2){toast('Keep at least one Admin');s.value='admin';return}try{await db.doc('users/'+s.dataset.role).update({role:s.value,updatedAt:new Date().toISOString()});toast('Role changed to '+ROLES[s.value])}catch(e){toast(refused(e))}});
+    vS.querySelectorAll('[data-role]').forEach(s=>s.onchange=async()=>{const id=s.dataset.role,old=users[id].role;s.disabled=true;try{await api('update',{uid:id,role:s.value});toast('Role changed to '+ROLES[s.value])}catch(e){s.value=old;toast(e.message)}finally{s.disabled=false}});
   }else if(setPage==='rights'&&role==='admin'){
     const R=pendR||rights(),sw=(r,k)=>`<div class="row"><span class="tx"><b>${RIGHT_LABEL[k][0]}</b>${RIGHT_LABEL[k][1]?`<small>${RIGHT_LABEL[k][1]}</small>`:''}</span><label class="sw"><input type="checkbox" data-r="${r}.${k}" ${R[r][k]?'checked':''} aria-label="${RIGHT_LABEL[k][0]}"><i></i></label></div>`;
     const fixed=(t,on,s)=>`<div class="row"><span class="tx"><b>${t}</b><small>${s}</small></span><label class="sw"><input type="checkbox" disabled ${on?'checked':''}><i></i></label></div>`;
@@ -916,8 +913,8 @@ function renderSettings(){
     setPage='about';
     vS.innerHTML=`${back}<h1>About & help</h1><div class="panel"><h3>Roles</h3><table class="guide"><tbody>${Object.keys(ROLES).map(k=>`<tr><td>${ROLES[k]}</td><td>${esc(ROLE_DESC[k])}</td></tr>`).join('')}</tbody></table></div>
       <div class="panel"><h3>Pending offloading</h3><p class="k" style="margin:0">New trips start as Loaded. They stay in Pending offloading until an Admin or Entry officer marks them Offloaded with the date. Trips waiting 3 or more days are flagged in red.</p></div>
-      <div class="panel"><h3>Login and security</h3><p class="k" style="margin:0">Each person logs in with the username or email and password the Admin created. Passwords are stored as salted hashes, never as plain text. The app itself opens through a Claude account it has been shared with; customer names and phone numbers can only be read through Editor accounts.</p></div>
-      <p class="mute" style="font-size:13px">Amasga–Zamson Transport Collaboration Scheme App · version 3.3</p>`;
+      <div class="panel"><h3>Login and security</h3><p class="k" style="margin:0">Each person logs in with the username or email and password the Admin created. Passwords are handled by Firebase Authentication and never stored in the app. Customer names and phone numbers can only be read by Admins and Entry officers; the database enforces this, not just the screen.</p></div>
+      <p class="mute" style="font-size:13px">Amasga–Zamson Transport Collaboration Scheme App · version 4 (standalone)</p>`;
   }
 }
 vS.addEventListener('click',e=>{const b=e.target.closest('[data-sp]');if(b){setPage=b.dataset.sp;vS.classList.remove('view');void vS.offsetWidth;vS.classList.add('view');window.scrollTo(0,0);renderSettings()}});
@@ -929,32 +926,31 @@ function accountDlg(id){
   const x=id?users[id]:null,pw=genPw();
   dialog(x?'Manage '+x.name:'Create account',`
     <label>Full name <span class="req">*</span><input class="in" id="aName" value="${esc(x?.name||'')}" autocomplete="off"></label>
-    <label>Username <span class="req">*</span> <span class="hint">${x?'(cannot be changed)':'(used to log in)'}</span><input class="in" id="aUser" value="${esc(id||'')}" ${x?'disabled':''} autocapitalize="none" spellcheck="false" placeholder="e.g. musa.ibrahim"></label>
-    <label>Email <span class="hint">(optional, can also be used to log in)</span><input class="in" id="aMail" type="email" value="${esc(x?.email||'')}" autocapitalize="none"></label>
+    <label>Username <span class="req">*</span> <span class="hint">${x?'(cannot be changed)':'(used to log in)'}</span><input class="in" id="aUser" value="${esc(x?.username||'')}" ${x?'disabled':''} autocapitalize="none" spellcheck="false" placeholder="e.g. musa.ibrahim"></label>
+    <label>Email <span class="hint">(optional, can also be used to log in and to reset a forgotten password)</span><input class="in" id="aMail" type="email" value="${esc(x?.email||'')}" autocapitalize="none"></label>
     ${x?'':`<label>Role<select class="in" id="aRole">${Object.entries(ROLES).map(([k,l])=>`<option value="${k}" ${k==='member'?'selected':''}>${l}</option>`).join('')}</select></label>`}
-    <label>${x?'Reset password':'Password'} <span class="hint">${x?'(leave blank to keep the current one)':'(share it with the person; they can change it later)'}</span><span class="pw"><input class="in" id="aPw" type="text" value="${x?'':esc(pw)}" autocomplete="new-password"><button type="button" id="aGen">New</button></span></label>
+    <label>${x?'Set a new password':'Password'} <span class="hint">${x?'(leave blank to keep the current one)':'(share it with the person; they can change it later)'}</span><span class="pw"><input class="in" id="aPw" type="text" value="${x?'':esc(pw)}" autocomplete="new-password"><button type="button" id="aGen">New</button></span></label>
     ${x&&id!==me?`<label class="chk"><input type="checkbox" id="aAct" ${x.active!==false?'checked':''}> Account active (untick to block login)</label>`:''}
     <p class="err" id="aE" style="padding:8px 0 0"></p>`,
    [...(x&&id!==me?[{label:'Delete',cls:'del',fn:()=>delAccount(id)}]:[]),{label:'Cancel',cls:'ghost',fn:()=>closeVeil('#vDlg')},{label:x?'Save changes':'Create account',fn:async()=>{
-     const n=$('#aName').value.trim(),u=x?id:$('#aUser').value.trim().toLowerCase(),m=$('#aMail').value.trim().toLowerCase(),p=$('#aPw').value,e=$('#aE');
-     const dupMail=m&&Object.entries(users).some(([k,v])=>k!==u&&(v.email||'')===m);
-     const er=!n?'Enter the full name.':!x&&!unameOk(u)?'Username: 3–30 characters, starting with a letter or number; letters, numbers, dot, dash, underscore.':!x&&users[u]?'That username is already taken.':!emailOk(m)?'Enter a valid email or leave it blank.':dupMail?'Another account already uses that email.':(!x||p)&&!pwOk(p)?'Password needs 8+ characters with letters and a number.':'';
+     const n=$('#aName').value.trim(),u=x?x.username:$('#aUser').value.trim().toLowerCase(),m=$('#aMail').value.trim().toLowerCase(),p=$('#aPw').value,e=$('#aE');
+     const er=!n?'Enter the full name.':!x&&!unameOk(u)?'Username: 3–30 characters, starting with a letter or number; letters, numbers, dot, dash, underscore.':!emailOk(m)?'Enter a valid email or leave it blank.':(!x||p)&&!pwOk(p)?'Password needs 8+ characters with letters and a number.':'';
      if(er){e.textContent=er;return}
-     const now=new Date().toISOString();let d={name:n,email:m,updatedAt:now};if(p)Object.assign(d,await newPw(p));
-     if(x&&id!==me){const act=$('#aAct').checked;if(!act&&x.role==='admin'&&Object.values(users).filter(v=>v.role==='admin'&&v.active!==false).length<2){e.textContent='Keep at least one active Admin.';return}d.active=act}
-     try{if(x){if(id===me&&p)sigNow=d.hash.slice(0,16);await db.doc('users/'+id).update(d);if(id===me&&p)setSession(me,d.hash,!!store?.getItem('az-sess'))}
-       else await db.doc('users/'+u).set({...d,role:$('#aRole').value,active:true,createdAt:now,createdBy:me});
-       closeVeil('#vDlg');if(!x||p)credDlg(n,u,m,p);else toast('Account saved')}catch(z){e.textContent=refused(z)}}}]);
+     const btn=$('#dlg [data-b]:last-child');btn.disabled=true;e.textContent='';
+     try{
+       if(x){const d={uid:id,name:n,email:m};if(p)d.password=p;if(id!==me)d.active=$('#aAct').checked;await api('update',d)}
+       else await api('create',{name:n,username:u,email:m,role:$('#aRole').value,password:p});
+       closeVeil('#vDlg');if(!x||p)credDlg(n,u,m,p);else toast('Account saved');
+     }catch(z){e.textContent=z.message;btn.disabled=false}}}]);
   $('#aGen').onclick=()=>{$('#aPw').value=genPw()};
 }
 function credDlg(n,u,m,p){
-  const txt=`Amasga-Zamson Transport Collaboration Scheme App login\nName: ${n}\nUsername: ${u}${m?'\nEmail: '+m:''}\nPassword: ${p}`;
+  const txt=`Amasga-Zamson Transport Collaboration Scheme App\nWeb address: ${location.origin}\nName: ${n}\nUsername: ${u}${m?'\nEmail: '+m:''}\nPassword: ${p}`;
   dialog('Login details for '+n,`<p class="mute" style="margin:0 0 10px">Send these to ${esc(n.split(' ')[0])}. This is the only time the password is shown.</p><pre class="panel" style="white-space:pre-wrap;margin:0;font:15px/1.6 ui-monospace,monospace">${esc(txt)}</pre>`,
     [{label:'Copy',cls:'ghost',fn:async()=>{try{await navigator.clipboard.writeText(txt);toast('Copied')}catch(e){toast('Select the text to copy')}}},{label:'Done',fn:()=>closeVeil('#vDlg')}]);
 }
 function delAccount(id){
-  if(users[id].role==='admin'&&Object.values(users).filter(v=>v.role==='admin'&&v.active!==false).length<2){$('#aE').textContent='Keep at least one active Admin.';return}
-  dialog('Delete '+users[id].name+'?','<p class="mute" style="margin:0">They will no longer be able to log in. Trips they entered are kept.</p>',[{label:'Cancel',cls:'ghost',fn:()=>closeVeil('#vDlg')},{label:'Delete account',fn:async()=>{try{await db.doc('users/'+id).delete();closeVeil('#vDlg');toast('Account deleted')}catch(e){toast(refused(e))}}}]);
+  dialog('Delete '+users[id].name+'?','<p class="mute" style="margin:0">They will no longer be able to log in. Trips they entered are kept.</p><p class="err" id="dE" style="padding:8px 0 0"></p>',[{label:'Cancel',cls:'ghost',fn:()=>closeVeil('#vDlg')},{label:'Delete account',fn:async()=>{try{await api('delete',{uid:id});closeVeil('#vDlg');toast('Account deleted')}catch(e){$('#dE').textContent=e.message}}}]);
 }
 
 /* ================= import ================= */
