@@ -630,6 +630,8 @@ function offloadDlg(ids,r){
 /* ================= sheets ================= */
 function openVeil(id){const v=$(id);v.classList.add('on');document.body.style.overflow='hidden';v.querySelector('.sheet').scrollTop=0}
 function closeVeil(id){$(id).classList.remove('on');if(!$$('.veil.on').length)document.body.style.overflow=''}
+/* Android back button: close the top sheet, then return to Records, then let the app close */
+window.azBack=()=>{const o=$$('.veil.on').pop();if(o){closeVeil('#'+o.id);return true}if(entered&&view==='settings'&&setPage!=='home'){setPage='home';renderSettings();return true}if(entered&&view!=='records'){go('records');return true}return false};
 $$('.veil').forEach(v=>v.addEventListener('click',e=>{if(e.target===v||e.target.closest('[data-close]'))closeVeil('#'+v.id)}));
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){const o=$$('.veil.on').pop();if(o)closeVeil('#'+o.id)}});
 function dialog(title,body,buttons){
@@ -777,7 +779,10 @@ const chartRO=new ResizeObserver(drawChart);
 /* ---------- exports ---------- */
 const csvCell=v=>{const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
 const csv=rows=>'﻿'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n');
-async function save(name,data){try{const b=data instanceof Blob?data:new Blob([data],{type:name.endsWith('.csv')?'text/csv;charset=utf-8':'application/octet-stream'}),u=URL.createObjectURL(b),el=document.createElement('a');el.href=u;el.download=name;document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),4000);toast('Downloaded '+name)}catch(e){toast('Download failed')}}
+async function save(name,data){
+  const mime=name.endsWith('.csv')?'text/csv':name.endsWith('.pdf')?'application/pdf':'application/octet-stream';
+  if(window.AndroidApp&&AndroidApp.saveFile){try{const b=data instanceof Blob?data:new Blob([data],{type:mime});const b64=await new Promise((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]);r.onerror=no;r.readAsDataURL(b)});AndroidApp.saveFile(b64,name,mime)}catch(e){toast('Download failed')}return}
+  try{const b=data instanceof Blob?data:new Blob([data],{type:name.endsWith('.csv')?'text/csv;charset=utf-8':'application/octet-stream'}),u=URL.createObjectURL(b),el=document.createElement('a');el.href=u;el.download=name;document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),4000);toast('Downloaded '+name)}catch(e){toast('Download failed')}}
 function loadScript(src){return new Promise((ok,no)=>{const sc=document.createElement('script');sc.src=src;sc.onload=ok;sc.onerror=no;document.head.appendChild(sc)})}
 $('#xRep').addEventListener('click',()=>{
   const k=$('#pPer').value;if(!k)return;const R=report(k),a=R.a,$m=can('amounts');
